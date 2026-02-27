@@ -1,0 +1,104 @@
+#version 460
+#extension GL_EXT_ray_tracing          : require
+#extension GL_EXT_scalar_block_layout  : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "common.glsl"
+
+// ---------------------------------------------------------------------------
+// Bindings
+// ---------------------------------------------------------------------------
+layout(binding = 0, set = 0) uniform accelerationStructureEXT tlas;
+layout(binding = 1, set = 0, rgba32f) uniform image2D outputImage;
+
+layout(binding = 2, set = 0) uniform CameraBlock {
+    mat4 invView;
+    mat4 invProj;
+    uint sampleCount;
+    uint frameIndex;
+} cam;
+
+layout(push_constant) uniform PC {
+    uint maxBounces;
+    uint samplesPerFrame;
+} pc;
+
+layout(location = 0) rayPayloadEXT RayPayload payload;
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+void main()
+{
+    const ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+    const ivec2 size  = ivec2(gl_LaunchSizeEXT.xy);
+
+    // Unique seed per pixel + sample so each accumulated frame differs
+    uint seed = pcgHash(uint(pixel.x + pixel.y * size.x)
+                        ^ (cam.sampleCount * 1664525u + 1013904223u));
+
+    // Sub-pixel jitter for anti-aliasing
+    vec2 jitter = rand2(seed) - 0.5;
+    vec2 uv     = (vec2(pixel) + 0.5 + jitter) / vec2(size);
+    uv          = uv * 2.0 - 1.0;
+
+    // Flip Y so that pixel(0,0) at the TOP maps to +y in view space
+    // (Vulkan image origin is top-left, GLM perspective has +y = up).
+    uv.y = -uv.y;
+
+    // Unproject NDC → view space using the (non-flipped) inverse projection
+    vec4 viewTarget = cam.invProj * vec4(uv, 1.0, 1.0);
+    viewTarget /= viewTarget.w;
+
+    vec3 rayOrigin = vec3(cam.invView * vec4(0.0, 0.0, 0.0, 1.0));
+    vec3 rayDir    = normalize(vec3(cam.invView * vec4(normalize(viewTarget.xyz), 0.0)));
+
+    // -----------------------------------------------------------------------
+    // Path trace — bounce loop (avoids shader recursion for bounces)
+    // -----------------------------------------------------------------------
+    vec3 finalColor = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+
+    for (uint bounce = 0; bounce <= pc.maxBounces; ++bounce)
+    {
+        payload.done       = false;
+        payload.seed       = seed;
+        payload.radiance   = vec3(0.0);
+        payload.throughput = vec3(1.0);
+
+        traceRayEXT(tlas,
+                    gl_RayFlagsOpaqueEXT,
+                    0xFF,          // cull mask
+                    0, 0,          // SBT record offset / stride
+                    0,             // miss index (sky)
+                    rayOrigin, 1e-3, rayDir, 1e4,
+                    0);            // payload location 0
+
+        seed = payload.seed;
+        finalColor += throughput * payload.radiance;
+
+        if (payload.done) break;
+
+        throughput *= payload.throughput;
+        rayOrigin   = payload.origin;
+        rayDir      = payload.direction;
+
+        // Russian roulette after 3 bounces to terminate low-contribution paths
+        if (bounce >= 3u) {
+            float p = max(throughput.r, max(throughput.g, throughput.b));
+            if (randFloat(seed) > p) break;
+            throughput /= p;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Temporal accumulation (running average)
+    // -----------------------------------------------------------------------
+    if (cam.sampleCount > 0u) {
+        vec3 prev = imageLoad(outputImage, pixel).rgb;
+        float w   = 1.0 / float(cam.sampleCount + 1u);
+        finalColor = mix(prev, finalColor, w);
+    }
+
+    imageStore(outputImage, pixel, vec4(finalColor, 1.0));
+}
