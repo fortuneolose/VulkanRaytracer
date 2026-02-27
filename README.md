@@ -50,7 +50,7 @@ All dependencies are fetched automatically at configure time via CMake `FetchCon
 ### Steps
 
 ```bash
-git clone https://github.com/FortuneMU2025/VulkanRaytracer.git
+git clone https://github.com/fortuneolose/VulkanRaytracer.git
 cd VulkanRaytracer
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
